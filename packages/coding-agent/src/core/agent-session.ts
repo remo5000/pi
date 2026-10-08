@@ -146,6 +146,12 @@ import {
 	normalizeBuildSystemPromptOptions,
 } from "./system-prompt.ts";
 import { type BashOperations, createLocalBashOperations } from "./tools/bash.ts";
+import {
+	type BashCompletion,
+	BashProcessManager,
+	formatBashCompletion,
+	getBashProcessManager,
+} from "./tools/bash-processes.ts";
 import { createAllToolDefinitions } from "./tools/index.ts";
 import { createToolDefinitionFromAgentTool } from "./tools/tool-definition-wrapper.ts";
 import { addUsageToTotals, combineUsage, createUsageTotals } from "./usage-totals.ts";
@@ -436,6 +442,10 @@ export class AgentSession {
 	private _resourceLoader: ResourceLoader;
 	private _customTools: ToolDefinition[];
 	private _baseToolDefinitions: Map<string, ToolDefinition> = new Map();
+	private _bashProcessManager?: BashProcessManager;
+	/** Keep replaced tools' managers until reload or dispose so their running jobs remain owned. */
+	private _externalBashSubscriptions = new Map<BashProcessManager, () => void>();
+	private _disposed = false;
 	private _cwd: string;
 	private _extensionRunnerRef?: { current?: ExtensionRunner };
 	private _initialActiveToolNames?: string[];
@@ -1391,6 +1401,8 @@ export class AgentSession {
 	 * Call this when completely done with the session.
 	 */
 	dispose(): void {
+		this._disposed = true;
+		this._disposeBashProcesses();
 		try {
 			this.abortRetry();
 			this.abortCompaction();
@@ -3502,6 +3514,16 @@ export class AgentSession {
 		const allowedTools = this._allowedTools;
 
 		const registeredTools = this._extensionRunner.getAllRegisteredTools();
+		for (const tool of [
+			...Object.values(this._baseToolsOverride ?? {}),
+			...this._customTools,
+			...registeredTools.map(({ definition }) => definition),
+		]) {
+			const manager = getBashProcessManager(tool);
+			if (manager && manager !== this._bashProcessManager && !this._externalBashSubscriptions.has(manager)) {
+				this._externalBashSubscriptions.set(manager, manager.onCompletion(this._sendBashCompletion));
+			}
+		}
 		const allCustomTools = [
 			...registeredTools,
 			...this._customTools.map((definition) => ({
@@ -3603,6 +3625,32 @@ export class AgentSession {
 		return this._isDeclarable(name) && this._toolDefinitions.get(name)?.definition.defaultActive !== false;
 	}
 
+	private _unsubscribeExternalBashCompletions(): void {
+		for (const unsubscribe of this._externalBashSubscriptions.values()) unsubscribe();
+		this._externalBashSubscriptions.clear();
+	}
+
+	private _sendBashCompletion = (completion: BashCompletion): void => {
+		if (this._disposed) return;
+		void this.sendCustomMessage(
+			{ customType: "bash_completion", content: formatBashCompletion(completion), display: true },
+			{ triggerTurn: true, deliverAs: "followUp" },
+		).catch((error) => {
+			this._extensionRunner.emitError({
+				extensionPath: "<runtime>",
+				event: "bash_completion",
+				error: error instanceof Error ? error.message : String(error),
+			});
+		});
+	};
+
+	private _disposeBashProcesses(): void {
+		const externalManagers = [...this._externalBashSubscriptions.keys()];
+		this._unsubscribeExternalBashCompletions();
+		this._bashProcessManager?.dispose();
+		for (const manager of externalManagers) manager.dispose();
+	}
+
 	private _buildRuntime(options: {
 		activeToolNames?: string[];
 		flagValues?: Map<string, boolean | string>;
@@ -3611,6 +3659,8 @@ export class AgentSession {
 		const autoResizeImages = this.settingsManager.getImageAutoResize();
 		const shellCommandPrefix = this.settingsManager.getShellCommandPrefix();
 		const shellPath = this.settingsManager.getShellPath();
+		this._bashProcessManager?.dispose();
+		this._bashProcessManager = new BashProcessManager(this._sendBashCompletion);
 		const baseToolDefinitions = this._baseToolsOverride
 			? Object.fromEntries(
 					Object.entries(this._baseToolsOverride).map(([name, tool]) => [
@@ -3620,7 +3670,7 @@ export class AgentSession {
 				)
 			: createAllToolDefinitions(this._cwd, {
 					read: { autoResizeImages },
-					bash: { commandPrefix: shellCommandPrefix, shellPath },
+					bash: { commandPrefix: shellCommandPrefix, shellPath, processManager: this._bashProcessManager },
 				});
 
 		this._baseToolDefinitions = new Map(
@@ -3660,6 +3710,11 @@ export class AgentSession {
 	async reload(options?: { beforeSessionStart?: () => void | Promise<void> }): Promise<void> {
 		const oldRunner = this._extensionRunner;
 		const previousFlagValues = oldRunner.getFlagValues();
+		// Reload reuses externally supplied tools. Cancel their jobs without disposing their managers.
+		const externalManagers = [...this._externalBashSubscriptions.keys()];
+		this._unsubscribeExternalBashCompletions();
+		await Promise.all(externalManagers.map((manager) => manager.abortAll()));
+		this._bashProcessManager?.dispose();
 		await emitSessionShutdownEvent(oldRunner, { type: "session_shutdown", reason: "reload" });
 		oldRunner.invalidate();
 		const getDefaultTools = () =>

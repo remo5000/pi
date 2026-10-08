@@ -4,12 +4,11 @@ import {
 	type BashSpawnContext,
 	type BashSpawnHook,
 	type BashToolDetails,
-	type BashToolInput,
 	type BashToolOptions,
-	type createBashTool,
 	createLocalShellOperations,
 	createShellToolDefinition,
 	type ShellToolConfig,
+	type ShellToolInput,
 } from "./bash.ts";
 import { wrapToolDefinition } from "./tool-definition-wrapper.ts";
 
@@ -24,7 +23,7 @@ export type PowerShellOperations = BashOperations;
 export type PowerShellSpawnContext = BashSpawnContext;
 export type PowerShellSpawnHook = BashSpawnHook;
 export type PowerShellToolDetails = BashToolDetails;
-export type PowerShellToolInput = BashToolInput;
+export type PowerShellToolInput = ShellToolInput;
 
 export interface PowerShellToolOptions
 	extends Pick<BashToolOptions, "operations" | "exposeSessionEnvironment" | "spawnHook"> {}
@@ -56,7 +55,10 @@ export function createPowerShellToolDefinition(
 	});
 }
 
-export function createPowerShellTool(cwd: string, options?: PowerShellToolOptions): ReturnType<typeof createBashTool> {
+export function createPowerShellTool(
+	cwd: string,
+	options?: PowerShellToolOptions,
+): ReturnType<typeof wrapToolDefinition<BashToolDetails | undefined>> {
 	const definition = createPowerShellToolDefinition(cwd, options);
 	const tool = wrapToolDefinition(definition);
 	Object.assign(tool, {

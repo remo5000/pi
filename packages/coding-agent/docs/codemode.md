@@ -15,7 +15,7 @@ A script may start with an options line:
 - `max_output_tokens` (default 10000) limits the output. Longer output keeps its start and end, and the full text is written to a temp file whose path is included in the result. A script fails when its output passes 16777216 characters of text and base64 image data or 100000 `text()`, `image()`, and `console` calls; write large data to a file with a tool instead.
 - `timeout_ms` is a hard deadline for the whole script. It is unset by default. Image generation can take minutes, so do not set a short deadline for scripts that generate images.
 
-The result starts with `Script completed` or `Script failed`, the wall time, and the output. Text and image items appear in order, each on its own line. When the output has more than one text item (from `text()` or `return`), each starts with a `==> text N/M <==` line. `console` calls follow in one `<console_output>` block with one line per call. A failed script keeps its partial output, followed by `Script error:` and the error. Tool calls are real: calls made before a failure are not undone. Calls still running when the script ends are cancelled, and unawaited promises are discarded.
+The result starts with `Script completed` or `Script failed`, the wall time, and the output. Text and image items appear in order, each on its own line. When the output has more than one text item (from `text()` or `return`), each starts with a `==> text N/M <==` line. `console` calls follow in one `<console_output>` block with one line per call. A failed script keeps its partial output, followed by `Script error:` and the error. Tool calls are real: calls made before a failure are not undone. Calls still running when the script ends are cancelled, and unawaited promises are discarded. A `bash` process that has already yielded survives the script; see [Run commands](#run-commands).
 
 ## Globals
 
@@ -40,7 +40,7 @@ Every tool the session can call is a method of `tools`, named by its identifier:
 
 What a call resolves to depends on the tool:
 
-- Tools with an output schema resolve to a structured value. `bash` resolves to `{ output, truncated, full_output_path?, exit_code, wall_time_seconds }`, also for non-zero exit codes. Its `output` is not limited to the 2000 lines or 50KB the model sees: it holds up to 1 MiB, and longer output keeps its first and last 512 KiB around an omission marker, with `truncated` set and the full output in `full_output_path`.
+- Tools with an output schema resolve to a structured value. `bash` resolves to `{ status: "exited", output, truncated, full_output_path?, wall_time_seconds, exit_code }` (also for non-zero exit codes) or `{ status: "running", output, truncated, full_output_path, wall_time_seconds, process_id }` (no `exit_code`). Exited `output` holds up to 1 MiB, beyond the 2000 lines or 50KB the model sees; longer output keeps its first and last 512 KiB around an omission marker, with `truncated` set and the full output in `full_output_path`. Running `output` is a bounded display snapshot, with full output in `full_output_path`.
 - MCP tools resolve to their `CallToolResult`, including `isError` and `structuredContent`.
 - `read` resolves to the file's text, or for an image to an image block `{ type: "image", data, mimeType, note }` that `image()` shows. `data` is the base64 image the model would see and `note` the text that goes with it, such as resize hints.
 - Other tools, such as `edit` and `write`, resolve to their text output.
@@ -50,6 +50,18 @@ A call that fails, is blocked, or gets invalid arguments rejects with an `Error`
 The `codemode` description lists tools with their TypeScript declarations, grouped by namespace (for example one MCP server). Tools with `deferred` exposure, which includes MCP tools with the default `codemode` exposure, are not listed, so the description stays the same while MCP servers connect. Listed declarations share a budget of 3000 estimated tokens (`codemode.inlineBudget` in [settings](settings.md#tools)). Scripts find the other tools with `searchTools()`, `describeTool()`, `describeNamespace()`, or by filtering `ALL_TOOLS`.
 
 While `codemode` is active, `codemode.mode` in [settings](settings.md#tools) decides how the other tools are presented. With `on` (default) declared tools stay declared, and their descriptions say how to call them from scripts. With `only` they are hidden from the model and listed in the `codemode` description instead, so the model calls them through scripts. Tool declarations in the `codemode` description, `describeTool()`, and `ALL_TOOLS` carry the tools' prompt guidelines, since the system prompt rules only cover declared tools.
+
+## Run commands
+
+`tools.bash({ command, timeout? })` blocks until the command exits unless you explicitly pass `yield_time_ms`. `yield_time_ms: 0` yields immediately; an integer from 1 to 30000 waits up to that many milliseconds before returning `status: "running"` if the command is still active. `timeout` remains a hard limit in seconds, including after yielding. Awaiting `tools.bash()` means the command exited **or** yielded, not that it succeeded: check `status`, then `exit_code` on exited results.
+
+```js
+const result = await tools.bash({ command: "npm run check", yield_time_ms: 1000 });
+if (result.status === "running") return { process_id: result.process_id, full_output_path: result.full_output_path };
+return { exit_code: result.exit_code, output: result.output };
+```
+
+A yielded process continues after the codemode script ends; the session reports its completion. Session disposal or reload stops it. Shell and working directory come from the existing settings and session configuration, not per-call arguments. User-entered `!` commands are unchanged.
 
 ## Store values
 

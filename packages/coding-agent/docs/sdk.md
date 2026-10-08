@@ -53,7 +53,7 @@ See the checked [sessions example](../examples/sdk/11-sessions.ts) for creating,
 
 `cwd` selects the workspace used for project resource discovery, context files, session grouping, and built-in tool paths. Pass it explicitly when the target differs from `process.cwd()`.
 
-`session.dispose()` aborts active work, invalidates extension contexts, disconnects from the agent, and removes event listeners. Call it when the session is no longer needed.
+`session.dispose()` aborts active work, stops yielded Bash processes, invalidates extension contexts, disconnects from the agent, and removes event listeners. Call it when the session is no longer needed. Reload also stops yielded processes.
 
 `AgentSessionRuntime` adds `newSession()`, `switchSession()`, `fork()`, and `importFromJsonl()`. Each operation replaces the active `AgentSession` and recreates services for the target working directory.
 
@@ -116,6 +116,10 @@ Inline extension factories can be supplied through `DefaultResourceLoader`. Give
 The CLI loads `codemode`, `tool_search`, and MCP as built-in extensions. SDK sessions do not; add `createCodemodeExtension()`, `createToolSearchExtension()`, and `createMcpExtension()` to the `extensionFactories` of `DefaultResourceLoader`. `codemode` and `tool_search` are registered inactive: enable them through the `defaultTools` setting (`["+codemode", "+tool_search"]` keeps the other default tools), or let the MCP extension activate them: `codemode` for servers with `codemode` exposure, `tool_search` for servers with `deferred` exposure. The MCP extension connects its servers on `session_start`, so call `session.bindExtensions()`. See [Codemode and MCP](../examples/sdk/14-codemode-mcp.ts).
 
 See the focused examples for [models](../examples/sdk/02-custom-model.ts), [tools](../examples/sdk/05-tools.ts), [extensions](../examples/sdk/06-extensions.ts), and [full control](../examples/sdk/12-full-control.ts).
+
+The `bash` tool keeps `command` and optional `timeout` (seconds). Omitting `yield_time_ms` blocks until exit; explicitly passing an integer from 0 to 30000 waits up to that many milliseconds before yielding (0 yields immediately). A running result has `process_id` and `full_output_path`, but no `exit_code`; the session reports completion later. See [Run commands](codemode.md#run-commands) for the structured result. The shell and working directory remain controlled by settings and the session, not per-call arguments; `!` commands are unchanged.
+
+Standalone `createBashTool()` and `createBashToolDefinition()` attach a `BashProcessManager` at runtime. Access it with `getBashProcessManager(tool)` (exported from the package root); the getter returns `undefined` if the tool has no manager. Dispose the manager when finished to stop yielded commands. Bash tools/definitions and their manager are single-session resources: create fresh instances for each session rather than sharing them, since disposal permanently disables a manager. When `onData` returns a promise, the built-in local executor awaits it for backpressure; custom Bash operations should do the same.
 
 ## Examples
 

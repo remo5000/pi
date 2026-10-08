@@ -10,6 +10,10 @@
 - **GPT-6 Luna and image classification**: OpenAI's GPT-6 Luna is available as a classifier model through the Decisions API, and codemode's `models.classify()` accepts images for classifiers that support them. See [Use classifier models](docs/models.md#use-classifier-models).
 - **Native llama.cpp decision models**: Julia-1, Laya, Kev, lev, and OpenJev served by llama.cpp 0.6.0 or later run natively as classifiers through `/v1/systemone`. See [Classification](docs/llama-cpp.md#classification).
 
+### Breaking Changes
+
+- `bash` structured results now have `status: "exited"` with `exit_code`, or `status: "running"` with `process_id` and `full_output_path` but no `exit_code`. Callers must check `status` before reading `exit_code`. Calls without `yield_time_ms` still block until exit; explicitly passing 0..30000 milliseconds allows a command to yield, with completion reported later. Yielded commands stop on session disposal or reload.
+
 ### Added
 
 - Added `+name` and `-name` entries to `--tools`, which change the default tool selection instead of replacing it, for example `pi -t +codemode`

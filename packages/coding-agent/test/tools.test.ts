@@ -503,6 +503,7 @@ describe("Coding Agent Tools", () => {
 			expect(result.isError).toBe(true);
 			expect(getTextOutput(result)).toBe("out\n\n\nCommand exited with code 3");
 			expect(result.structuredContent).toEqual({
+				status: "exited",
 				output: "out\n",
 				truncated: false,
 				exit_code: 3,

@@ -53,6 +53,8 @@ export class OutputAccumulator {
 
 	private tempFilePath: string | undefined;
 	private tempFileStream: WriteStream | undefined;
+	private tempFileError: Error | undefined;
+	private closePromise: Promise<void> | undefined;
 
 	constructor(options: OutputAccumulatorOptions = {}) {
 		this.maxLines = options.maxLines ?? DEFAULT_MAX_LINES;
@@ -118,7 +120,26 @@ export class OutputAccumulator {
 		};
 	}
 
+	/** Keep a readable log even when output has not reached the truncation limit. */
+	persistFullOutput(): string {
+		this.ensureTempFile();
+		if (!this.tempFilePath) throw new Error("Output log was not created");
+		return this.tempFilePath;
+	}
+
+	async flushTempFile(): Promise<void> {
+		if (this.tempFileError) throw this.tempFileError;
+		if (this.closePromise) return this.closePromise;
+		const stream = this.tempFileStream;
+		if (!stream) return;
+		await new Promise<void>((resolve, reject) => {
+			stream.write("", (error) => (error ? reject(error) : resolve()));
+		});
+	}
+
 	async closeTempFile(): Promise<void> {
+		if (this.tempFileError) throw this.tempFileError;
+		if (this.closePromise) return this.closePromise;
 		if (!this.tempFileStream) {
 			return;
 		}
@@ -126,7 +147,7 @@ export class OutputAccumulator {
 		const stream = this.tempFileStream;
 		this.tempFileStream = undefined;
 
-		await new Promise<void>((resolve, reject) => {
+		this.closePromise = new Promise<void>((resolve, reject) => {
 			const onError = (error: Error) => {
 				stream.off("finish", onFinish);
 				reject(error);
@@ -139,6 +160,7 @@ export class OutputAccumulator {
 			stream.once("finish", onFinish);
 			stream.end();
 		});
+		await this.closePromise;
 	}
 
 	/**
@@ -249,6 +271,9 @@ export class OutputAccumulator {
 		const { path, stream } = createOutputFileStream(this.tempFilePrefix, ".log");
 		this.tempFilePath = path;
 		this.tempFileStream = stream;
+		stream.on("error", (error) => {
+			this.tempFileError = error;
+		});
 		for (const chunk of this.rawChunks) {
 			this.tempFileStream.write(chunk);
 		}

@@ -5,10 +5,12 @@ export {
 	type BashToolDetails,
 	type BashToolInput,
 	type BashToolOptions,
+	type BashToolOutput,
 	createBashTool,
 	createBashToolDefinition,
 	createLocalBashOperations,
 } from "./bash.ts";
+export { type BashCompletion, BashProcessManager, getBashProcessManager } from "./bash-processes.ts";
 export {
 	createEditTool,
 	createEditToolDefinition,
