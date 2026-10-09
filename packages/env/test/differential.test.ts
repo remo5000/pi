@@ -48,6 +48,7 @@ function normalize(value: unknown, root: string): unknown {
 	const json = JSON.stringify(value, (key, field: unknown) => {
 		if (field instanceof Uint8Array) return { bytes: Buffer.from(field).toString("hex") };
 		if (key === "mtimeMs") return "mtime";
+		if (key === "wall_time_seconds") return "elapsed";
 		if (field && typeof field === "object" && "ok" in field && (field as Result<unknown, FileError>).ok === false) {
 			return { ok: false, code: (field as unknown as { error: FileError }).error.code };
 		}

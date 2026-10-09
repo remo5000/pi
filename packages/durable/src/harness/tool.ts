@@ -5,21 +5,13 @@ import type { ImageContent, TextContent, ToolCall, ToolResultMessage } from "@ea
 import { validateToolArguments } from "@earendil-works/pi-ai/utils/validation";
 import { AssistantEntry, ToolResultEntry } from "../entries.ts";
 import { defineTask } from "../tasks.ts";
+import { type CommandTool, commandFactory, executeToolInvocation } from "../tools/bash-command.ts";
 import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, utf8ByteLength } from "../truncate.ts";
-import type {
-	ConversationId,
-	EntryId,
-	JsonObject,
-	Task,
-	TaskId,
-	TaskOptions,
-	TaskRuntime,
-	Tx,
-	TypedEntry,
-} from "../types.ts";
+import type { ConversationId, EntryId, JsonObject, TaskRuntime, Tx, TypedEntry } from "../types.ts";
 import { assignJson } from "./json.ts";
 import { clearProgress, finishSlot, LiveDoc, type ToolSlot, toolSlot } from "./live.ts";
 import { boundOutput, OutputBuffer, type OutputLimits, PROGRESS_BYTES_PER_SECOND, Progress } from "./output.ts";
+import { createToolExecutionApi } from "./tool-api.ts";
 import type {
 	ToolControl,
 	ToolDiagnostic,
@@ -85,7 +77,13 @@ export const ToolTask = defineTask<ToolTaskInput, ToolTaskCheckpoint, ToolTaskRe
 			await runtime.commit(async (tx) => {
 				const slot = toolSlot(await tx.doc(LiveDoc, runtime.conversationId), runtime.taskId);
 				if (slot !== undefined) slot.status = "running";
-				const intent = { phase: "execute", arguments: final, replay: tool.replay ?? "unsafe" } as const;
+				const yieldingBash =
+					final.yield_time_ms !== undefined && (tool as CommandTool)[commandFactory] !== undefined;
+				const intent = {
+					phase: "execute",
+					arguments: final,
+					replay: yieldingBash ? "unsafe" : (tool.replay ?? "unsafe"),
+				} as const;
 				return { status: "running", checkpoint: intent };
 			}, context);
 			await run(runtime, call, tool, final, context);
@@ -95,7 +93,11 @@ export const ToolTask = defineTask<ToolTaskInput, ToolTaskCheckpoint, ToolTaskRe
 			const { arguments: args, replay } = task.state.checkpoint;
 			const call = await readCall(runtime, task.input, context);
 			const tool = (await runtime.agent(context)).tools.find((each) => each.name === call.name);
-			if (replay === "safe" && tool?.replay === "safe") {
+			if (
+				replay === "safe" &&
+				tool?.replay === "safe" &&
+				!(args.yield_time_ms !== undefined && (tool as CommandTool)[commandFactory] !== undefined)
+			) {
 				// The rerun reports from scratch; clear what the interrupted attempt published.
 				await runtime.commit(async (tx) => {
 					const slot = toolSlot(await tx.doc(LiveDoc, runtime.conversationId), runtime.taskId);
@@ -180,17 +182,22 @@ async function run(
 	};
 	const reported: Reported = { output: new OutputBuffer(limits), limits, diagnostics: [], details: undefined };
 	const progress = publishProgress(runtime, reported, context);
+	const blockingBash = args.yield_time_ms === undefined && (tool as CommandTool)[commandFactory] !== undefined;
+	const commandDetails = (
+		value: JsonValue | undefined,
+		snapshot: { text: string; droppedBytes: number },
+	): JsonValue | undefined => {
+		// Redact before persistence too: interruption reconstructs the result from the live slot.
+		if (blockingBash && typeof value === "object" && value !== null && "status" in value && value.status === "exited")
+			return { ...value, output: snapshot.text, truncated: snapshot.droppedBytes > 0 };
+		return value;
+	};
 	let ended = false;
 	const assertLive = (): void => {
 		if (ended) throw new Error(`Tool call ${call.id} has settled`);
 	};
-	const api: Omit<ToolExecutionApi, "env"> = {
-		taskId: runtime.taskId,
-		conversationId: runtime.conversationId,
+	const reporting: Pick<ToolExecutionApi, "callId" | "output" | "outputWindow" | "diagnostic" | "details"> = {
 		callId: call.id,
-		registry: runtime.registry,
-		agent: runtime.agent,
-		models: runtime.models,
 		output: (chunk, skipped) => {
 			assertLive();
 			if (reported.output.push(chunk, skipped)) progress.mark();
@@ -212,40 +219,14 @@ async function run(
 		details: async (value, detailsContext) => {
 			assertLive();
 			detailsContext.abortSignal?.throwIfAborted();
-			reported.details = copyJson(value, { omitUndefinedProperties: true });
+			reported.details = copyJson(commandDetails(value, reported.output.snapshot()), {
+				omitUndefinedProperties: true,
+			});
 			const committed = progress.markAndWait();
 			// Cancelling the wait leaves the update in place; the commit's own outcome stays observed.
 			committed.catch(() => {});
 			return awaitWithContext(committed, detailsContext);
 		},
-		commit: async (change, commitContext) => {
-			let result: Awaited<ReturnType<typeof change>> | undefined;
-			await runtime.commit(async (tx) => {
-				result = await change(tx);
-				return undefined;
-			}, commitContext);
-			return result as Awaited<ReturnType<typeof change>>;
-		},
-		memo: runtime.memo,
-		createTask: async <I, S extends { phase: string }, R, H extends object>(
-			task: Task<I, S, R, H>,
-			input: I,
-			options: Omit<TaskOptions, "conversationId">,
-			taskContext: Context,
-		): Promise<TaskId<R>> => {
-			let id: TaskId<R> | undefined;
-			await runtime.commit(async (tx) => {
-				id = await tx.createTask(task, input, options);
-				return undefined;
-			}, taskContext);
-			return id!;
-		},
-		getTask: runtime.getTask,
-		waitForTask: runtime.waitForTask,
-		conversation: runtime.conversation,
-		snapshot: runtime.snapshot,
-		snapshotAsOf: runtime.snapshotAsOf,
-		watchDoc: runtime.watchDoc,
 	};
 
 	let result: ToolExecutionResult;
@@ -257,7 +238,7 @@ async function run(
 		const env = await runtime.env(context);
 		const startedAt = performance.now();
 		try {
-			result = await tool.execute(args, { ...api, env }, context);
+			result = await executeToolInvocation(tool, args, createToolExecutionApi(runtime, reporting, env), context);
 		} finally {
 			durationMs = Math.round(performance.now() - startedAt);
 		}
@@ -277,6 +258,16 @@ async function run(
 	// Details still waiting for a progress commit settle with the terminal commit, the final flush.
 	const pending = await progress.stop();
 	try {
+		if (blockingBash) {
+			const snapshot =
+				result.content === undefined
+					? reported.output.snapshot()
+					: boundOutput(
+							result.content.flatMap((item) => (item.type === "text" ? [item.text] : [])).join(""),
+							limits,
+						);
+			result = { ...result, details: commandDetails(result.details ?? reported.details, snapshot) };
+		}
 		const settled = await finalResult(runtime, call, result, reported, context);
 		await settle(runtime, call, ending, () => settled, context, durationMs);
 	} catch (error) {

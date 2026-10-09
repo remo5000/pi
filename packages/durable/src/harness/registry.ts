@@ -1,3 +1,4 @@
+import { BashCommandTask } from "../tools/bash-command.ts";
 import { INSTRUCTIONS_KEY } from "./agent.ts";
 import { CompactionTask } from "./compaction.ts";
 import { GenerationTask } from "./generation.ts";
@@ -7,7 +8,7 @@ import type { AnyTask, Extension, PromptSection, Registry, RegistrySnapshot, Too
 const SECTION_KEY = /^[a-z][a-z0-9_-]*$/;
 
 /** Built-in task definitions every registry holds; they are not an extension and cannot be removed or replaced. */
-export const BUILTIN_TASKS: readonly AnyTask[] = [GenerationTask, ToolTask, CompactionTask];
+export const BUILTIN_TASKS: readonly AnyTask[] = [GenerationTask, ToolTask, CompactionTask, BashCommandTask];
 
 /** Immutable published registry state. */
 class RegistryState<Tool extends ToolRegistration> implements RegistrySnapshot<Tool> {

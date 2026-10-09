@@ -8,6 +8,7 @@ const ERROR = 3;
 const EVENT = 4;
 const CANCEL = 5;
 const PING = 6;
+const SPAWN_READY = 7;
 
 const MAX_FRAME = 16 * 1024 * 1024;
 const PING_INTERVAL_MS = 5000;
@@ -80,8 +81,8 @@ export interface RequestOptions {
 	signal?: AbortSignal;
 	/** Progress events of the request, such as `exec` output. */
 	onEvent?: (json: Json, payload: Uint8Array) => void;
-	/** The request's id and session, for `kill`. */
-	onStart?: (id: number, session: number) => void;
+	/** The request's id and session, for `kill`, and a per-request acknowledgement after observing command startup. */
+	onStart?: (id: number, session: number, acknowledgeSpawn: () => void) => void;
 	/**
 	 * Only run in this daemon session, for requests on handles it opened. After the connection was lost and started
 	 * again, such requests fail instead of reaching a daemon that never opened the handle.
@@ -242,7 +243,7 @@ export class Connection {
 				...(options.onEvent ? { onEvent: options.onEvent } : {}),
 			});
 			options.signal?.addEventListener("abort", onAbort, { once: true });
-			options.onStart?.(id, session.id);
+			options.onStart?.(id, session.id, () => this.#write(session, frame(SPAWN_READY, id, {})));
 			this.#write(session, frame(REQUEST, id, { ...json, op }, options.payload));
 			if (options.signal?.aborted) onAbort();
 		});
@@ -293,8 +294,8 @@ export class Connection {
 		}, PING_INTERVAL_MS);
 		session.timer.unref();
 		try {
-			const { json } = await Promise.race([this.#send(session, "hello", { protocol: 1 }, {}), failed]);
-			if (json.protocol !== 1) throw lost(`Unsupported protocol ${json.protocol}`);
+			const { json } = await Promise.race([this.#send(session, "hello", { protocol: 2 }, {}), failed]);
+			if (json.protocol !== 2) throw lost(`Unsupported protocol ${json.protocol}`);
 			return { info: json as unknown as RemoteInfo, session };
 		} catch (error) {
 			this.#teardown(session, error instanceof Error ? error : lost(String(error)));

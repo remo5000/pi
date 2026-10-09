@@ -349,6 +349,7 @@ class RemoteTextLineReader implements TextLineReader {
  * that machine: the daemon performs the system calls, and this class applies Node's path, error, and result rules.
  */
 export class RemoteExecutionEnv implements ExecutionEnv {
+	readonly reportsSpawn = true;
 	readonly id: string;
 	cwd: string;
 	readonly connection: Connection;
@@ -849,8 +850,10 @@ export class RemoteExecutionEnv implements ExecutionEnv {
 		}
 		const inheritEnv = options?.inheritEnv ?? true;
 		let cwd: string;
+		let logPath: string | undefined;
 		try {
 			cwd = options?.cwd ? await this.#resolve(options.cwd) : this.cwd;
+			if (options?.spill?.path !== undefined) logPath = await this.#resolve(options.spill.path);
 		} catch (error) {
 			return err(new ExecutionError("unknown", error instanceof Error ? error.message : String(error)));
 		}
@@ -862,9 +865,24 @@ export class RemoteExecutionEnv implements ExecutionEnv {
 			if (value !== undefined) env[key.toWellFormed()] = value;
 		}
 		let callbackError: ExecutionError | undefined;
+		let protocolError: ExecutionError | undefined;
+		let observedSpawn = false;
+		let spawnObserver: Promise<void> = Promise.resolve();
 		let settled = false;
 		let running: number | undefined;
+		let acknowledgeSpawn: (() => void) | undefined;
 		const controller = new AbortController();
+		const releaseSpawn = () => {
+			const acknowledge = acknowledgeSpawn;
+			acknowledgeSpawn = undefined;
+			acknowledge?.();
+		};
+		const failProtocol = (message: string) => {
+			protocolError = new ExecutionError("unknown", message);
+			if (logPath !== undefined) protocolError.spillPath = logPath;
+			controller.abort();
+			releaseSpawn();
+		};
 		const onAbort = () => controller.abort();
 		signal?.addEventListener("abort", onAbort, { once: true });
 		try {
@@ -877,17 +895,53 @@ export class RemoteExecutionEnv implements ExecutionEnv {
 					inheritEnv,
 					...(this.#shellPath === undefined ? {} : { shellPath: this.#shellPath }),
 					...(timeout === undefined ? {} : { timeoutMs: timeout * 1000 }),
-					...(options?.spill === undefined ? {} : { spill: options.spill }),
+					...(options?.spill === undefined
+						? {}
+						: { spill: { ...options.spill, ...(logPath === undefined ? {} : { path: logPath }) } }),
 					...(options?.window === undefined ? {} : { window: options.window }),
 				},
 				{
 					signal: controller.signal,
-					onStart: (requestId, session) => {
+					onStart: (requestId, session, acknowledge) => {
 						running = requestId;
+						acknowledgeSpawn = acknowledge;
 						this.#running.set(requestId, session);
 					},
 					onEvent: (event, payload) => {
-						if (settled || callbackError !== undefined || event.kind !== "output") return;
+						if (settled || callbackError !== undefined || protocolError !== undefined) return;
+						if (event.kind === "spawned") {
+							const pid = event.pid;
+							if (
+								observedSpawn ||
+								!Number.isSafeInteger(pid) ||
+								typeof pid !== "number" ||
+								pid <= 0 ||
+								payload.length !== 0
+							) {
+								failProtocol("Invalid spawned PID event from pi-env");
+								return;
+							}
+							observedSpawn = true;
+							if (options?.onSpawn !== undefined) {
+								spawnObserver = Promise.resolve()
+									.then(() => options.onSpawn!(pid, context))
+									.catch((error: unknown) => {
+										const cause = error instanceof Error ? error : new Error(String(error));
+										callbackError = new ExecutionError("callback_error", cause.message, cause);
+										if (logPath !== undefined) callbackError.spillPath = logPath;
+										controller.abort();
+									})
+									.finally(releaseSpawn);
+							} else {
+								releaseSpawn();
+							}
+							return;
+						}
+						if (event.kind !== "output") return;
+						if (!observedSpawn) {
+							failProtocol("Output received before spawned PID from pi-env");
+							return;
+						}
 						const text = Buffer.from(payload.buffer, payload.byteOffset, payload.length).toString("utf8");
 						if (text === "" || options?.onOutput === undefined) return;
 						const info: ShellOutputInfo = { stream: event.stream === "stderr" ? "stderr" : "stdout" };
@@ -902,12 +956,17 @@ export class RemoteExecutionEnv implements ExecutionEnv {
 					},
 				},
 			);
+			await spawnObserver;
+			if (protocolError) return err(protocolError);
 			if (callbackError) return err(callbackError);
+			if (!observedSpawn) return err(new ExecutionError("unknown", "Missing spawned PID from pi-env"));
 			return ok({
 				exitCode: json.exitCode as number,
 				...(typeof json.spillPath === "string" ? { spillPath: json.spillPath } : {}),
 			});
 		} catch (error) {
+			await spawnObserver;
+			if (protocolError) return err(protocolError);
 			if (callbackError) return err(callbackError);
 			if (!(error instanceof RemoteError)) {
 				return err(new ExecutionError("unknown", error instanceof Error ? error.message : String(error)));

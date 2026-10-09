@@ -177,6 +177,26 @@ const Timing = defineExtension({
 });
 ```
 
+### Bash yielding
+
+Bash remains blocking unless the call supplies `yield_time_ms`, an integer from `0` to `30000`. Zero waits for actual backend startup, not completion. `timeout` remains a hard execution timeout after yielding. PowerShell is unchanged.
+
+```json
+{ "command": "run-tests", "timeout": 120, "yield_time_ms": 1000 }
+```
+
+The result's `details` is a `CommandResult` (exported from `@earendil-works/pi-durable/env`):
+
+- `status: "exited"` includes `exit_code`.
+- `status: "running"` has no exit code, requires `full_output_path`, and may include the backend's numeric `pid`. It is **not success**; dependent work must inspect `status`.
+- Both include bounded combined `output`, `truncated`, and `wall_time_seconds`. Running results omit the preview until the wrapper's completed output policy has run. Completion uses the wrapper's returned text when supplied, otherwise its reported stream. Interrupted or failed wrapper invocations report the error and log location without an unfinished preview. The full output path is in the backend's namespace, not necessarily the host filesystem.
+
+A yielded command runs as a conversation-owned background task. Ordinary aborts and idle waits exclude it; `abort(context, { background: true })` cancels it too. Completion arrives as one bounded `[BASH]` follow-up input. Closing the Harness cancels and joins execution. Reopening never reruns a command whose launch intent was committed, reattaches a process, or signals a saved PID. Explicit-yield Bash remains non-replayable even if a wrapper declares `replay: "safe"`. A still-unscheduled task may first launch after reopening if its original implementation remains available.
+
+The selected Bash wrapper runs once, in the command task; `beforeTool` and `afterTool` run once on the originating call. `BashPrepare` receives the **command task's** invocation API, so its task ID, memo, commits, and owned work belong to that task. Prepared environment values and rewritten scripts stay in invocation memory, not durable command input. Wrappers must preserve the invocation API's capabilities, as an object spread does. Registry changes after a task phase starts keep its pinned implementation; a factory change before reservation fails opt-in execution without launching.
+
+Custom backends must advertise `reportsSpawn: true`, call and await `onSpawn` after real startup (a PID may be omitted), and support eager complete logging through `spill.path`. Backends without this capability reject yielding before launch. Output paths larger than 46 KiB also reject before launch, reserving room for status and error metadata within the completion budget. Remote execution requires the updated client and daemon. Pre-yield cancellation currently polls the original call's abort intent every 20 ms until its terminal receipt; this is a prototype trade-off, not a management API.
+
 ## System Prompt
 
 The system prompt is built from the selected extensions' sections, rendered in order before each request. A section sees the resolved agent, the environment built for the request, and committed documents:

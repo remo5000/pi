@@ -9,6 +9,7 @@ pub const ERROR: u8 = 3;
 pub const EVENT: u8 = 4;
 pub const CANCEL: u8 = 5;
 pub const PING: u8 = 6;
+pub const SPAWN_READY: u8 = 7;
 
 /// Largest frame either side accepts.
 pub const MAX_FRAME: usize = 16 * 1024 * 1024;

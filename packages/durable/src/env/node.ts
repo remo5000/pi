@@ -271,7 +271,7 @@ function getShellEnv(
 	};
 }
 
-function killProcessTree(pid: number): void {
+function killProcessTree(pid: number, allowPidFallback = true): void {
 	if (process.platform === "win32") {
 		try {
 			const child = spawn(
@@ -294,12 +294,22 @@ function killProcessTree(pid: number): void {
 	try {
 		process.kill(-pid, "SIGKILL");
 	} catch {
+		if (!allowPidFallback) return;
 		try {
 			process.kill(pid, "SIGKILL");
 		} catch {
 			// Process already dead.
 		}
 	}
+}
+
+function killSpawnedChild(child: ChildProcess): void {
+	if (!child.pid) return;
+	const exited = child.exitCode !== null || child.signalCode !== null;
+	// After the leader exits, only its still-open pipes justify a group signal. A PID-based fallback or
+	// Windows taskkill could target another process after the leader has been reaped.
+	if (exited && (process.platform === "win32" || (!child.stdout?.readable && !child.stderr?.readable))) return;
+	killProcessTree(child.pid, !exited);
 }
 
 function waitForChildProcess(
@@ -601,13 +611,14 @@ function symlinkRefused(path: string, cause?: Error): FileError {
 }
 
 export class NodeExecutionEnv implements ExecutionEnv {
+	readonly reportsSpawn = true;
 	/** Every local environment sees the same files. */
 	readonly id: string = "node:local";
 	cwd: string;
 	private shellPath?: string;
 	private shellEnv?: NodeJS.ProcessEnv;
 	private watchOptions: NodeWatchOptions;
-	private activeChildPids = new Set<number>();
+	private activeChildren = new Set<ChildProcess>();
 
 	constructor(options: { cwd: string; shellPath?: string; shellEnv?: NodeJS.ProcessEnv; watch?: NodeWatchOptions }) {
 		this.cwd = options.cwd;
@@ -691,6 +702,24 @@ export class NodeExecutionEnv implements ExecutionEnv {
 			);
 		}
 
+		// An explicit log must be open before the process can produce any output (or even start).
+		let logFile: FileHandle | undefined;
+		const requestedPath = options?.spill?.path;
+		if (requestedPath !== undefined) {
+			try {
+				logFile = await openFile(resolvePath(this.cwd, requestedPath), constants.O_WRONLY | constants.O_APPEND);
+			} catch (error) {
+				const cause = toError(error);
+				return err(
+					new ExecutionError("unknown", `Failed to preserve complete shell output: ${cause.message}`, cause),
+				);
+			}
+		}
+		if (signal?.aborted) {
+			await logFile?.close();
+			return err(new ExecutionError("aborted", "aborted"));
+		}
+
 		return await new Promise((resolvePromise) => {
 			let settled = false;
 			let timedOut = false;
@@ -704,9 +733,12 @@ export class NodeExecutionEnv implements ExecutionEnv {
 			let spillStart: Promise<void> | undefined;
 			let spillStream: WriteStream | undefined;
 			let spillBackpressured = false;
+			let observer: Promise<void> = Promise.resolve();
+			let observerPending = options?.onSpawn !== undefined;
+			const pendingOutput: { source: ShellOutputInfo["stream"]; chunk: Uint8Array }[] = [];
 
 			const onAbort = () => {
-				if (child?.pid) killProcessTree(child.pid);
+				if (child) killSpawnedChild(child);
 			};
 			const failCallback = (error: unknown) => {
 				if (callbackError !== undefined) return;
@@ -732,10 +764,11 @@ export class NodeExecutionEnv implements ExecutionEnv {
 
 			const settle = (result: Result<ShellExecResult, ExecutionError>) => {
 				if (settled) return;
+				if (!result.ok && spillPath !== undefined) result.error.spillPath = spillPath;
 				settled = true;
 				if (timeoutId) clearTimeout(timeoutId);
 				if (signal) signal.removeEventListener("abort", onAbort);
-				if (child?.pid) this.activeChildPids.delete(child.pid);
+				if (child) this.activeChildren.delete(child);
 				resolvePromise(result);
 			};
 			const pauseOutput = () => {
@@ -743,7 +776,7 @@ export class NodeExecutionEnv implements ExecutionEnv {
 				child?.stderr?.pause();
 			};
 			const resumeOutput = () => {
-				if (callbackError || spillError || timedOut || signal?.aborted || spillBackpressured) return;
+				if (spillError || spillBackpressured || observerPending) return;
 				child?.stdout?.resume();
 				child?.stderr?.resume();
 			};
@@ -788,6 +821,40 @@ export class NodeExecutionEnv implements ExecutionEnv {
 					.catch(failSpill)
 					.finally(resumeOutput);
 			};
+			if (logFile !== undefined) {
+				spillPath = resolvePath(this.cwd, requestedPath!);
+				try {
+					spillStream = logFile.createWriteStream({ highWaterMark: SPILL_HIGH_WATER_MARK });
+					spillStream.on("error", failSpill);
+				} catch (error) {
+					const cause = toError(error);
+					void logFile.close().then(
+						() =>
+							settle(
+								err(
+									new ExecutionError(
+										"unknown",
+										`Failed to preserve complete shell output: ${cause.message}`,
+										cause,
+									),
+								),
+							),
+						(closeError: unknown) => {
+							const reason = toError(closeError);
+							settle(
+								err(
+									new ExecutionError(
+										"unknown",
+										`Failed to close shell output file: ${reason.message}`,
+										reason,
+									),
+								),
+							);
+						},
+					);
+					return;
+				}
+			}
 			const finishSpill = async (): Promise<void> => {
 				await spillStart;
 				const stream = spillStream;
@@ -807,16 +874,37 @@ export class NodeExecutionEnv implements ExecutionEnv {
 					stdio: [stdinCommand === undefined ? "ignore" : "pipe", "pipe", "pipe"],
 					windowsHide: true,
 				});
-				if (child.pid) this.activeChildPids.add(child.pid);
+				if (child.pid) this.activeChildren.add(child);
 				if (stdinCommand !== undefined) {
 					child.stdin?.on("error", () => {});
 					child.stdin?.end(stdinCommand);
 				}
 			} catch (error) {
 				const cause = toError(error);
-				settle(err(new ExecutionError("spawn_error", cause.message, cause)));
+				void finishSpill().then(() => settle(err(new ExecutionError("spawn_error", cause.message, cause))));
 				return;
 			}
+
+			// Node emits `spawn` only when the OS created the child. A pid on the ChildProcess before that
+			// event is not evidence that startup succeeded.
+			child.once("spawn", () => {
+				const pid = child?.pid;
+				if (options?.onSpawn === undefined) return;
+				observer = Promise.resolve()
+					.then(() => {
+						if (!Number.isSafeInteger(pid) || pid === undefined || pid <= 0) {
+							throw new Error("Spawned process has no valid PID");
+						}
+						return options.onSpawn!(pid, context);
+					})
+					.catch(failCallback)
+					.finally(() => {
+						observerPending = false;
+						for (const { source, chunk } of pendingOutput) consume(source, chunk);
+						pendingOutput.length = 0;
+						resumeOutput();
+					});
+			});
 
 			timeoutId =
 				timeoutMs === undefined
@@ -831,9 +919,14 @@ export class NodeExecutionEnv implements ExecutionEnv {
 				else signal.addEventListener("abort", onAbort, { once: true });
 			}
 
-			const feed = (source: ShellOutputInfo["stream"], decoder: StreamDecoder) => (chunk: Uint8Array) => {
+			const consume = (source: ShellOutputInfo["stream"], chunk: Uint8Array): void => {
+				const decoder = source === "stdout" ? stdoutDecoder : stderrDecoder;
 				emit(decoder.decode(chunk), source);
 				const spill = options?.spill;
+				if (spillStream !== undefined && requestedPath !== undefined) {
+					writeSpill(chunk);
+					return;
+				}
 				if (spill === undefined || chunk.length === 0) return;
 				if (spillStart !== undefined) {
 					startSpill(chunk);
@@ -850,17 +943,29 @@ export class NodeExecutionEnv implements ExecutionEnv {
 				spillPrefix.length = 0;
 				startSpill(chunk);
 			};
-			child.stdout?.on("data", feed("stdout", stdoutDecoder));
-			child.stderr?.on("data", feed("stderr", stderrDecoder));
-
-			void waitForChildProcess(
+			const feed = (source: ShellOutputInfo["stream"]) => (chunk: Uint8Array) => {
+				if (observerPending) {
+					// A pipe may emit its final chunk despite pause when the child exits. Keep only chunks already delivered.
+					pendingOutput.push({ source, chunk });
+					pauseOutput();
+					return;
+				}
+				consume(source, chunk);
+			};
+			child.stdout?.on("data", feed("stdout"));
+			child.stderr?.on("data", feed("stderr"));
+			const childExit = waitForChildProcess(
 				child,
 				() =>
-					spillError === undefined &&
-					spillStart !== undefined &&
-					(spillStream === undefined || spillBackpressured),
-			).then(
+					observerPending ||
+					(spillError === undefined &&
+						(spillBackpressured || (spillStart !== undefined && spillStream === undefined))),
+			);
+			// Both `feed` and `waitForChildProcess` attach data listeners, which switch pipes into flowing mode.
+			if (observerPending) pauseOutput();
+			void childExit.then(
 				async ({ code, signal: exitSignal }) => {
+					await observer;
 					await finishSpill();
 					emit(stdoutDecoder.decode(), "stdout");
 					emit(stderrDecoder.decode(), "stderr");
@@ -874,7 +979,6 @@ export class NodeExecutionEnv implements ExecutionEnv {
 							? new ExecutionError("aborted", "aborted")
 							: undefined;
 					if (interrupted !== undefined) {
-						if (spillPath !== undefined) interrupted.spillPath = spillPath;
 						settle(err(interrupted));
 						return;
 					}
@@ -888,7 +992,11 @@ export class NodeExecutionEnv implements ExecutionEnv {
 					const exitCode = code ?? (exitSignal ? 128 + (osConstants.signals[exitSignal] ?? 0) : 1);
 					settle(ok({ exitCode, ...(spillPath === undefined ? {} : { spillPath }) }));
 				},
-				(error: Error) => settle(err(new ExecutionError("spawn_error", error.message, error))),
+				async (error: Error) => {
+					await observer;
+					await finishSpill();
+					settle(err(callbackError ?? new ExecutionError("spawn_error", error.message, error)));
+				},
 			);
 		});
 	}
@@ -1211,7 +1319,7 @@ export class NodeExecutionEnv implements ExecutionEnv {
 		if (!dir.ok) return dir;
 		const filePath = join(dir.value, `${options?.prefix ?? ""}${randomUUID()}${options?.suffix ?? ""}`);
 		try {
-			await writeFile(filePath, "");
+			await writeFile(filePath, "", { mode: 0o600 });
 			return ok(filePath);
 		} catch (error) {
 			return err(toFileError(error, filePath));
@@ -1219,8 +1327,8 @@ export class NodeExecutionEnv implements ExecutionEnv {
 	}
 
 	async cleanup(_context: Context): Promise<void> {
-		for (const pid of this.activeChildPids) killProcessTree(pid);
-		this.activeChildPids.clear();
+		for (const child of this.activeChildren) killSpawnedChild(child);
+		this.activeChildren.clear();
 	}
 }
 export type { NodeWatchOptions } from "./node-watch.ts";

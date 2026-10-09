@@ -17,6 +17,7 @@ import {
 } from "@earendil-works/pi-durable";
 import { describe, expect, it } from "vitest";
 import { agentHooks, resolveAgent, resolveSettings } from "../src/harness/agent.ts";
+import { BashCommandTask } from "../src/tools/bash-command.ts";
 import { context } from "./session-support.ts";
 
 type AppTool = ToolRegistration & { readonly snippet?: string };
@@ -127,10 +128,10 @@ describe("registry", () => {
 	it("always holds the built-in tasks, which are not an extension", () => {
 		const registry = createRegistry();
 		expect(registry.snapshot().installed()).toEqual([]);
-		expect(registry.snapshot().tasks()).toEqual([GenerationTask, ToolTask, CompactionTask]);
+		expect(registry.snapshot().tasks()).toEqual([GenerationTask, ToolTask, CompactionTask, BashCommandTask]);
 		const custom = task("app.custom");
 		registry.install(defineExtension({ name: "custom", tasks: [custom] }));
-		expect(registry.snapshot().tasks()).toEqual([GenerationTask, ToolTask, CompactionTask, custom]);
+		expect(registry.snapshot().tasks()).toEqual([GenerationTask, ToolTask, CompactionTask, BashCommandTask, custom]);
 		expect(registry.snapshot().task("app.custom")).toBe(custom);
 		registry.uninstall(defineExtension({ name: "custom" }));
 		expect(registry.snapshot().task("app.custom")).toBeUndefined();

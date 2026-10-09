@@ -267,7 +267,9 @@ pub fn configure(
     unsafe {
         command.pre_exec(|| {
             // A new session, so a kill reaches every descendant; default signal handling and an empty mask, as libuv sets.
-            libc::setsid();
+            if libc::setsid() == -1 {
+                return Err(io::Error::last_os_error());
+            }
             for signal in 1..32 {
                 if signal != libc::SIGKILL && signal != libc::SIGSTOP {
                     libc::signal(signal, libc::SIG_DFL);
@@ -283,14 +285,11 @@ pub fn configure(
 
 pub fn after_spawn(_child: &Child) {}
 
-/// Kill the command's process group, or the process if the group is gone.
+/// Every command is a session leader. Only its group can be safely signalled after the leader was reaped.
 pub fn kill_tree(pid: u32) {
-    let pid = pid as i32;
-    // SAFETY: plain signal delivery.
+    // SAFETY: plain signal delivery; ESRCH means the group no longer exists.
     unsafe {
-        if libc::kill(-pid, libc::SIGKILL) != 0 {
-            libc::kill(pid, libc::SIGKILL);
-        }
+        libc::kill(-(pid as i32), libc::SIGKILL);
     }
 }
 

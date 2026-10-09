@@ -14,7 +14,7 @@ mod window;
 
 use errors::Failure;
 use exec::Control;
-use frame::{CANCEL, ERROR, Frame, PING, REQUEST, RESULT};
+use frame::{CANCEL, ERROR, Frame, PING, REQUEST, RESULT, SPAWN_READY};
 use output::Output;
 use serde_json::{Value, json};
 use std::collections::{HashMap, VecDeque};
@@ -27,7 +27,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-const PROTOCOL: u64 = 1;
+const PROTOCOL: u64 = 2;
 /// The npm package version this daemon ships with (build.rs).
 const VERSION: &str = env!("PI_ENV_VERSION");
 const PING_INTERVAL: Duration = Duration::from_secs(5);
@@ -305,8 +305,8 @@ fn scan_lines(file: &File, path: &str, json: &Value, control: &Control) -> Resul
 }
 
 fn kill_all(groups: &exec::Groups) {
-    for pid in groups.lock().unwrap().iter() {
-        exec::kill_group(*pid);
+    for (pid, reaped) in groups.lock().unwrap().iter() {
+        exec::kill_group(*pid, reaped.load(Ordering::SeqCst));
     }
 }
 
@@ -388,10 +388,40 @@ fn run_in_order(jobs: &Sender<Job>, handle: Arc<FileHandle>, job: Job) {
 
 fn serve_frames(server: &Arc<Server>, input: &mut impl Read) -> io::Result<()> {
     let jobs = start_workers();
+    let mut negotiated = false;
     while let Some(request) = frame::read_frame(input)? {
         match request.kind {
             REQUEST => {
                 let id = request.id;
+                if request.json["op"] == "hello" {
+                    if request.json["protocol"].as_u64() != Some(PROTOCOL) {
+                        server.output.control(Frame::new(
+                            ERROR,
+                            id,
+                            Failure::new(
+                                "EINVAL",
+                                format!(
+                                    "Unsupported pi-env protocol {}, expected {PROTOCOL}",
+                                    request.json["protocol"]
+                                ),
+                            )
+                            .to_json(),
+                        ));
+                        continue;
+                    }
+                    negotiated = true;
+                } else if !negotiated {
+                    server.output.control(Frame::new(
+                        ERROR,
+                        id,
+                        Failure::new(
+                            "EINVAL",
+                            format!("pi-env protocol {PROTOCOL} hello required"),
+                        )
+                        .to_json(),
+                    ));
+                    continue;
+                }
                 // Registered before the request runs, so a cancel right behind it is not lost.
                 let control = Arc::new(Control::default());
                 server.controls.lock().unwrap().insert(id, control.clone());
@@ -423,10 +453,14 @@ fn serve_frames(server: &Arc<Server>, input: &mut impl Read) -> io::Result<()> {
                     }
                 }
             }
-            CANCEL => {
+            CANCEL | SPAWN_READY => {
                 let control = server.controls.lock().unwrap().get(&request.id).cloned();
                 if let Some(control) = control {
-                    control.cancel(request.json["mode"].as_str() == Some("kill"));
+                    if request.kind == CANCEL {
+                        control.cancel(request.json["mode"].as_str() == Some("kill"));
+                    } else {
+                        control.spawn_ready();
+                    }
                 }
             }
             _ => {}
@@ -512,5 +546,51 @@ fn main() {
             eprintln!("usage: pi-env serve --token <hex>");
             std::process::exit(2);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_old_hello_and_exec_without_a_matching_handshake() {
+        let output = Arc::new(Output::default());
+        let server = Arc::new(Server {
+            output: output.clone(),
+            tmpdir: sys::tmpdir(),
+            handles: Mutex::new(HashMap::new()),
+            next_handle: AtomicU64::new(1),
+            controls: Mutex::new(HashMap::new()),
+            groups: Arc::new(Mutex::new(HashMap::new())),
+        });
+        let mut input = Vec::new();
+        frame::write_frame(
+            &mut input,
+            &Frame::new(REQUEST, 1, json!({ "op": "hello", "protocol": 1 })),
+        )
+        .unwrap();
+        frame::write_frame(
+            &mut input,
+            &Frame::new(
+                REQUEST,
+                2,
+                json!({ "op": "exec", "cwd": "/", "argv": ["__pi_env_missing_program__"] }),
+            ),
+        )
+        .unwrap();
+        serve_frames(&server, &mut input.as_slice()).unwrap();
+        output.close();
+        let mut wire = Vec::new();
+        output.run(&mut wire);
+        let mut replies = wire.as_slice();
+        for id in [1, 2] {
+            let reply = frame::read_frame(&mut replies)
+                .unwrap()
+                .expect("missing rejection");
+            assert_eq!((reply.kind, reply.id), (ERROR, id));
+            assert_eq!(reply.json["code"], "EINVAL");
+        }
+        assert!(frame::read_frame(&mut replies).unwrap().is_none());
     }
 }

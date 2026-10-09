@@ -64,7 +64,7 @@ export type ExecutionErrorCode =
 
 export class ExecutionError extends Error {
 	public code: ExecutionErrorCode;
-	/** Spill file of a command that timed out or was aborted after its output crossed the spill thresholds. */
+	/** Complete output file, if one was opened or a threshold spill was started. */
 	public spillPath?: string;
 
 	constructor(code: ExecutionErrorCode, message: string, cause?: Error) {
@@ -235,16 +235,18 @@ export interface FileSystem {
 	cleanup(context: Context): Promise<void>;
 }
 
-/** Spill the complete output to a temporary file once it exceeds either threshold. */
+/** Preserve complete raw combined output, either eagerly to a caller-created path or on crossing a threshold. */
 export interface ShellSpillOptions {
 	afterBytes: number;
 	/** Complete or partial lines. */
 	afterLines: number;
+	/** Existing file in this environment's namespace. Append all output, including when thresholds are not crossed. */
+	path?: string;
 }
 
 export interface ShellExecResult {
 	exitCode: number;
-	/** Temporary file holding the complete raw output, when the spill thresholds were exceeded. */
+	/** File holding the complete raw output, when requested explicitly or when thresholds were exceeded. */
 	spillPath?: string;
 }
 
@@ -258,6 +260,8 @@ export interface ShellExecOptions {
 	 * unbounded, and unthrottled. Each stream is decoded separately, so a character split across chunks survives.
 	 */
 	onOutput?: (text: string, context: Context, info: ShellOutputInfo) => void;
+	/** Called once after real backend startup (never on failure). PID may be unavailable; rejection kills and reaps the command. */
+	onSpawn?: (pid: number | undefined, context: Context) => void | Promise<void>;
 	spill?: ShellSpillOptions;
 	/**
 	 * The caller keeps only this tail of the output, so the environment may omit output outside it and report the omission
@@ -307,6 +311,8 @@ export interface ShellOutputInfo {
 }
 
 export interface Shell {
+	/** Whether this shell can report real command startup through `onSpawn`, even if its PID is unavailable. */
+	readonly reportsSpawn?: boolean;
 	/**
 	 * Run a command. A string runs through the environment's shell. An array runs `command[0]` directly with the rest
 	 * as its arguments, without a shell, so they reach the program unparsed. Aborting the context or a timeout kills
@@ -323,5 +329,6 @@ export interface Shell {
 
 export interface ExecutionEnv extends FileSystem, Shell {}
 
+export type { CommandOutput, CommandResult, CommandState } from "./command-state.ts";
 export { rangeDecoder, StreamDecoder, startsWithBom } from "./decode.ts";
 export { LineScanner } from "./line-scan.ts";

@@ -1,6 +1,6 @@
 # pi-env wire protocol
 
-Version 1. The client starts `pi-env serve --token <hex>` (over `ssh`, or directly in tests) and talks to it over the
+Version 2. The client starts `pi-env serve --token <hex>` (over `ssh`, or directly in tests) and talks to it over the
 process's stdin and stdout. stderr is diagnostic text for logs only.
 
 ## Sync
@@ -33,6 +33,7 @@ does not parse gets an `EINVAL` error; framing errors end the connection.
 | 4 | event | daemon → client | progress of a running request (`exec` output, `watch` changes), not finishing it |
 | 5 | cancel | client → daemon | cancel request `id`; see below |
 | 6 | ping | both | liveness; the receiver ignores it |
+| 7 | spawn-ready | client → daemon | startup callback for `exec` request `id` settled; release only that command's pipe readers |
 
 Errors are `{ code, message, syscall?, path? }`. `code` is a Node-style error code (`ENOENT`, `EISDIR`,
 `ERR_FS_EISDIR`, ...) or one of the execution codes `shell_unavailable`, `spawn_error`, `timeout`, `aborted`, `unknown`.
@@ -66,7 +67,9 @@ handles belong to the daemon that opened them, so requests on them fail instead 
 
 ## Operations
 
-`hello { protocol }` → `{ protocol, version, os, arch, home, tmpdir, cwd, driveCwds, pid }`. The first request.
+`hello { protocol: 2 }` → `{ protocol: 2, version, os, arch, home, tmpdir, cwd, driveCwds, pid }`. The first
+request. The daemon rejects a different protocol or any operation before a matching hello with `EINVAL`; it never
+starts an incompatible client's command. The client also refuses a daemon whose hello result is not protocol 2.
 `version` is the npm package version the daemon shipped with; `os` and `arch` are Rust's `std::env::consts` values;
 `tmpdir` follows the remote Node's `os.tmpdir()` rules; `cwd` and `driveCwds` (Windows' `=C:` variables) are what
 Node's `path.resolve` falls back to for drive-relative paths.
@@ -100,8 +103,12 @@ bytes of a name that is not valid UTF-8, for sorting. Handles are numbers, valid
 connection; opening more than 4096 fails with `EMFILE`.
 
 `exec { command | argv, cwd, env, inheritEnv, shellPath?, timeoutMs?, spill?, window? }` runs a shell string or an
-argv array. While it runs, `event` frames `{ kind: "output", stream, skipped? }` carry decoded output text as UTF-8
-payload. With `window { maxBytes, maxLines, minIntervalMs, bytesPerSecond }`, output is coalesced and paced like the
+argv array. After spawning the child, the daemon sends `event { kind: "spawned", pid }` with its actual PID. It does not
+read that command's stdout or stderr until the client sends `spawn-ready`, including when the child exits first; OS pipe
+capacity bounds output during the wait without blocking other requests. The command timeout remains armed through
+startup acknowledgement and output draining. If the callback fails, the client cancels the command and then sends
+`spawn-ready` so it can be reaped and its log completed. While it runs, `event` frames
+`{ kind: "output", stream, skipped? }` carry decoded output text as UTF-8 payload. With `window { maxBytes, maxLines, minIntervalMs, bytesPerSecond }`, output is coalesced and paced like the
 caller's commits, at most one output frame per command is unsent, and output followed by more than the window is
 replaced by `skipped { bytes, newlines, endsWithNewline }` on the next event, which carries all output after it
 (`ShellOutputInfo.skipped`). The result is `{ exitCode, spillPath? }`; failures are errors with codes `timeout` or
