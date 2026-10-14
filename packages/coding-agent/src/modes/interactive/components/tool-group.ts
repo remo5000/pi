@@ -11,6 +11,7 @@ import type { ToolExecutionComponent } from "./tool-execution.ts";
 /** Group visibility never changes the output expansion state of its children. */
 export class ToolGroupComponent implements Component {
 	private content = new Container();
+	private members = new Set<ToolExecutionComponent>();
 	private outputPad: number;
 	expanded = false;
 
@@ -22,12 +23,18 @@ export class ToolGroupComponent implements Component {
 		return this.content.children as ToolExecutionComponent[];
 	}
 
+	hasTool(tool: ToolExecutionComponent): boolean {
+		return this.members.has(tool);
+	}
+
 	addTool(tool: ToolExecutionComponent, index = this.content.children.length): void {
 		this.content.children.splice(index, 0, tool);
+		this.members.add(tool);
 	}
 
 	removeTool(tool: ToolExecutionComponent): void {
 		this.content.removeChild(tool);
+		this.members.delete(tool);
 	}
 
 	setExpanded(expanded: boolean): void {

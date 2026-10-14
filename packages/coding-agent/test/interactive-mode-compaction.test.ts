@@ -144,6 +144,7 @@ describe("InteractiveMode compaction events", () => {
 			defaultEditor: {},
 			statusContainer: { clear: vi.fn() },
 			chatContainer: { clear: vi.fn() },
+			trailingToolGroupLookup: { lastChild: new Container(), group: undefined },
 			sessionManager: { buildContextEntries: vi.fn().mockReturnValue([latestCompaction, previousCompaction]) },
 			renderSessionEntries: vi.fn(),
 			addMessageToChat: vi.fn(),
@@ -156,6 +157,7 @@ describe("InteractiveMode compaction events", () => {
 			ui: { requestRender: vi.fn(), terminal: { setProgress: vi.fn() } },
 		};
 
+		Object.setPrototypeOf(fakeThis, InteractiveMode.prototype);
 		const handleEvent = Reflect.get(InteractiveMode.prototype, "handleEvent") as (
 			this: typeof fakeThis,
 			event: {
@@ -181,6 +183,7 @@ describe("InteractiveMode compaction events", () => {
 		});
 
 		expect(fakeThis.chatContainer.clear).toHaveBeenCalledTimes(1);
+		expect(fakeThis.trailingToolGroupLookup).toBeUndefined();
 		expect(fakeThis.renderSessionEntries).toHaveBeenCalledWith([previousCompaction]);
 		expect(fakeThis.addMessageToChat).toHaveBeenCalledTimes(1);
 		expect(fakeThis.addMessageToChat).toHaveBeenCalledWith(

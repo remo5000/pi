@@ -515,6 +515,7 @@ export class InteractiveMode {
 	// Tool output expansion state
 	private toolOutputExpanded = false;
 	private toolGroupsExpanded = false;
+	private trailingToolGroupLookup: { lastChild: Component; group: ToolGroupComponent | undefined } | undefined;
 
 	// Thinking block visibility state
 	private hideThinkingBlock = false;
@@ -2014,7 +2015,7 @@ export class InteractiveMode {
 						return { cancelled: true };
 					}
 
-					this.chatContainer.clear();
+					this.clearChat();
 					this.renderInitialMessages();
 					if (result.editorText && !this.editor.getText().trim()) {
 						this.editor.setText(result.editorText);
@@ -2214,7 +2215,7 @@ export class InteractiveMode {
 
 	private renderCurrentSessionState(): void {
 		this.loadedResourcesContainer.clear();
-		this.chatContainer.clear();
+		this.clearChat();
 		this.pendingMessagesContainer.clear();
 		this.compactionQueuedMessages = [];
 		this.streamingComponent = undefined;
@@ -2385,6 +2386,7 @@ export class InteractiveMode {
 	}
 
 	private setHiddenThinkingLabel(label?: string): void {
+		this.trailingToolGroupLookup = undefined;
 		this.hiddenThinkingLabel = label ?? this.defaultHiddenThinkingLabel;
 		for (const child of this.chatContainer.children) {
 			if (child instanceof AssistantMessageComponent) {
@@ -3471,7 +3473,7 @@ export class InteractiveMode {
 				} else if (event.entry.type === "compaction") {
 					const entries = this.sessionManager.buildContextEntries();
 					if (entries[0]?.id !== event.entry.id) break;
-					this.chatContainer.clear();
+					this.clearChat();
 					const branch = this.sessionManager.getBranch();
 					const compactionIndex = branch.findIndex((entry) => entry.id === event.entry.id);
 					const entriesAfterCompaction = new Set(branch.slice(compactionIndex + 1).map((entry) => entry.id));
@@ -3692,7 +3694,7 @@ export class InteractiveMode {
 					if (entries[0]?.type !== "compaction") {
 						throw new Error("Completed compaction is missing from the session context");
 					}
-					this.chatContainer.clear();
+					this.clearChat();
 					// The latest compaction is prepended for model context; append it below at its chronological position.
 					this.renderSessionEntries(entries.slice(1));
 					this.addMessageToChat(
@@ -3857,20 +3859,40 @@ export class InteractiveMode {
 		return component;
 	}
 
+	private clearChat(): void {
+		this.chatContainer.clear();
+		this.trailingToolGroupLookup = undefined;
+	}
+
 	private getTrailingToolGroup(): ToolGroupComponent | undefined {
 		const children = this.chatContainer.children;
+		const cached = this.trailingToolGroupLookup;
+		let group: ToolGroupComponent | undefined;
 		for (let index = children.length - 1; index >= 0; index--) {
 			const child = children[index];
+			// Reuse the checked suffix, but inspect the active assistant again for late visible content.
+			if (child === cached?.lastChild && child !== this.streamingComponent) {
+				group = cached.group;
+				break;
+			}
 			if (child instanceof StatusText) {
 				// Each status owns its preceding spacer; neither row separates tool calls.
 				if (children[index - 1] instanceof Spacer) index--;
 				continue;
 			}
-			if (child instanceof AssistantMessageComponent && child.render(this.ui.terminal.columns).length === 0)
+			if (child instanceof AssistantMessageComponent && child.render(this.ui.terminal.columns).length === 0) {
+				if (child === cached?.lastChild) {
+					group = cached.group;
+					break;
+				}
 				continue;
-			return child instanceof ToolGroupComponent ? child : undefined;
+			}
+			group = child instanceof ToolGroupComponent ? child : undefined;
+			break;
 		}
-		return undefined;
+		const lastChild = children.at(-1);
+		this.trailingToolGroupLookup = lastChild ? { lastChild, group } : undefined;
+		return group;
 	}
 
 	private addToolExecutionToChat(component: ToolExecutionComponent): void {
@@ -3888,7 +3910,17 @@ export class InteractiveMode {
 	}
 
 	private prepareStreamingToolGroup(visibleBoundary = false): void {
+		if (visibleBoundary) this.trailingToolGroupLookup = undefined;
 		if (!this.streamingComponent || !this.streamingMessage) return;
+		// Status feedback can anchor the cache after the assistant whose content just became visible.
+		const cached = this.trailingToolGroupLookup;
+		if (
+			cached &&
+			cached.lastChild !== cached.group &&
+			this.streamingComponent.render(this.ui.terminal.columns).length > 0
+		) {
+			this.trailingToolGroupLookup = undefined;
+		}
 		// IDs can recur across turns; relocation must never pick up historical components.
 		const currentTools = new Set<ToolExecutionComponent>();
 		for (const content of this.streamingMessage.content) {
@@ -3899,10 +3931,11 @@ export class InteractiveMode {
 		if (currentTools.size === 0) return;
 		const children = this.chatContainer.children;
 		const last = this.getTrailingToolGroup();
-		if (last && Array.from(currentTools).every((tool) => last.tools.includes(tool))) return;
+		if (last && Array.from(currentTools).every((tool) => last.hasTool(tool))) return;
 		const compact = this.settingsManager.getCompactToolCalls();
 		if (compact && !visibleBoundary && this.streamingComponent.render(this.ui.terminal.columns).length === 0) return;
 		const assistantIndex = children.indexOf(this.streamingComponent);
+		this.trailingToolGroupLookup = undefined;
 		// Visible boundaries and disabling grouping move current calls below their assistant row, retaining identities.
 		const movedTools: ToolExecutionComponent[] = [];
 		for (const child of children.slice(0, assistantIndex)) {
@@ -3936,7 +3969,7 @@ export class InteractiveMode {
 		const children = this.chatContainer.children.flatMap((child): Component[] =>
 			child instanceof ToolGroupComponent ? [...child.tools] : [child],
 		);
-		this.chatContainer.clear();
+		this.clearChat();
 		for (const child of children) {
 			if (child instanceof ToolExecutionComponent) {
 				this.addToolExecutionToChat(child);
@@ -4353,7 +4386,7 @@ export class InteractiveMode {
 	}
 
 	private rebuildChatFromMessages(): void {
-		this.chatContainer.clear();
+		this.clearChat();
 		this.renderSessionEntries(this.sessionManager.buildContextEntries());
 	}
 
@@ -4700,6 +4733,7 @@ export class InteractiveMode {
 
 	/** Update rendered assistant messages without rebuilding live tool components. */
 	private updateThinkingBlockVisibility(): void {
+		this.trailingToolGroupLookup = undefined;
 		for (const child of this.chatContainer.children) {
 			if (child instanceof AssistantMessageComponent) {
 				child.setHideThinkingBlock(this.hideThinkingBlock);
@@ -5790,7 +5824,7 @@ export class InteractiveMode {
 						}
 
 						// Update UI
-						this.chatContainer.clear();
+						this.clearChat();
 						this.renderInitialMessages();
 						if (result.editorText && !this.editor.getText().trim()) {
 							this.editor.setText(result.editorText);

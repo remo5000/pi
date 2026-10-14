@@ -1,7 +1,8 @@
 // INV-1 interactive-mode.ts: live, fallback, and replay group only consecutive tool rows.
 // INV-2 interactive-mode.ts: late visible assistant content splits groups without replacing tools.
 // INV-3 interactive-mode.ts: Ctrl+O cycles compact display; standalone visibility/output controls stay independent.
-// Revert interactive-mode.ts -> all compact-mode assertions fail.
+// INV-4 interactive-mode.ts/tool-group.ts: adjacent batches require linear lookup work in replay, regrouping, and live updates.
+// Revert interactive-mode.ts -> compact assertions fail; revert tool-group.ts -> live membership checks fail.
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { Container, Text, type TUI } from "@earendil-works/pi-tui";
@@ -10,11 +11,12 @@ import type { AgentSessionEvent } from "../src/core/agent-session.ts";
 import { KeybindingsManager } from "../src/core/keybindings.ts";
 import { type SessionEntry, SessionManager } from "../src/core/session-manager.ts";
 import { SettingsManager } from "../src/core/settings-manager.ts";
-import type { AssistantMessageComponent } from "../src/modes/interactive/components/assistant-message.ts";
+import { AssistantMessageComponent } from "../src/modes/interactive/components/assistant-message.ts";
 import { CustomEditor } from "../src/modes/interactive/components/custom-editor.ts";
 import type { SettingsSelectorComponent } from "../src/modes/interactive/components/settings-selector.ts";
 import { ThemedText } from "../src/modes/interactive/components/themed-text.ts";
 import { ToolExecutionComponent } from "../src/modes/interactive/components/tool-execution.ts";
+import type { ToolGroupComponent } from "../src/modes/interactive/components/tool-group.ts";
 import { InteractiveMode } from "../src/modes/interactive/interactive-mode.ts";
 import { getEditorTheme, initTheme } from "../src/modes/interactive/theme/theme.ts";
 import { stripAnsi } from "../src/utils/ansi.ts";
@@ -152,6 +154,54 @@ describe("InteractiveMode tool grouping", () => {
 		expect(output).not.toContain("output one");
 	});
 
+	test.each(["replay", "regroup"] as const)("%s bounds boundary probes across long tool-only runs", (path) => {
+		const count = 256;
+		const { mode } = createMode(path === "replay");
+		const messages = Array.from({ length: count }, (_, index) => assistant(`call-${index}`));
+		if (path === "regroup") mode.renderSessionItems(messages);
+		const render = vi.spyOn(AssistantMessageComponent.prototype, "render");
+		try {
+			if (path === "replay") mode.renderSessionItems(messages);
+			else mode.setCompactToolCalls(true);
+			expect(groups(mode)).toHaveLength(1);
+			expect(groups(mode)[0].tools).toHaveLength(count);
+			expect(render.mock.calls.length).toBeLessThanOrEqual(count * 2);
+		} finally {
+			render.mockRestore();
+		}
+	});
+
+	test("live batches bound both boundary probes and group membership reads", async () => {
+		const count = 128;
+		const { mode } = createMode();
+		await stream(mode, assistant("first"));
+		await finish(mode, "first");
+		const group = groups(mode)[0] as ToolGroupComponent;
+		let memberReads = 0;
+		const members = new Proxy(group.tools, {
+			get(target, property, receiver) {
+				if (typeof property === "string" && /^\d+$/.test(property)) memberReads++;
+				return Reflect.get(target, property, receiver);
+			},
+		});
+		const tools = vi.spyOn(group, "tools", "get").mockReturnValue(members);
+		const render = vi.spyOn(AssistantMessageComponent.prototype, "render");
+		try {
+			for (let index = 0; index < count; index++) {
+				const id = `call-${index}`;
+				await stream(mode, assistant(id));
+				await finish(mode, id);
+			}
+			expect(groups(mode)).toEqual([group]);
+			expect(group.tools).toHaveLength(count + 1);
+			expect(render.mock.calls.length).toBeLessThanOrEqual(count * 8);
+			expect(memberReads).toBeLessThanOrEqual(count * 4);
+		} finally {
+			render.mockRestore();
+			tools.mockRestore();
+		}
+	});
+
 	test("fallback execution starts reuse existing tool identities and exclude nested calls", async () => {
 		const { mode } = createMode();
 		await mode.handleEvent({
@@ -225,6 +275,81 @@ describe("InteractiveMode tool grouping", () => {
 		expect(output.indexOf("late prose")).toBeGreaterThan(output.indexOf("1 tool ·"));
 		expect(output.lastIndexOf("1 tool ·")).toBeGreaterThan(output.indexOf("late prose"));
 	});
+
+	test.each(["message_update", "message_end"] as const)(
+		"late prose behind cached Ctrl+O feedback still splits groups on %s",
+		async (eventType) => {
+			const { mode } = createMode();
+			const editor = new CustomEditor(Reflect.get(mode, "ui") as TUI, getEditorTheme(), new KeybindingsManager());
+			Object.assign(mode, { editor, defaultEditor: editor });
+			mode.setupKeyHandlers();
+			await stream(mode, assistant("old"));
+			await finish(mode, "old");
+			const message = assistant("new");
+			await mode.handleEvent({ type: "message_start", message: { ...message, content: [] } });
+			editor.handleInput("\x0f");
+			await mode.handleEvent({
+				type: "message_update",
+				message,
+				assistantMessageEvent: { type: "done", reason: "toolUse", message },
+			});
+			const child = mode.pendingTools.get("new");
+			expect(groups(mode)).toHaveLength(1);
+			const visible = assistant("new", [{ type: "text", text: "late prose" }]);
+			if (eventType === "message_update") {
+				await mode.handleEvent({
+					type: "message_update",
+					message: visible,
+					assistantMessageEvent: { type: "done", reason: "toolUse", message: visible },
+				});
+			} else {
+				await mode.handleEvent({ type: "message_end", message: visible });
+			}
+			expect(groups(mode).map((group) => group.tools.map((tool) => tool.getToolCallId()))).toEqual([
+				["old"],
+				["new"],
+			]);
+			expect(groups(mode)[1].tools[0]).toBe(child);
+			const output = stripAnsi(mode.chatContainer.render(100).join("\n"));
+			expect(output.indexOf("late prose")).toBeGreaterThan(output.indexOf("1 tool ·"));
+			expect(output.lastIndexOf("1 tool ·")).toBeGreaterThan(output.indexOf("late prose"));
+			expect(output).toContain("Tool display: previews");
+		},
+	);
+
+	test.each(["tool", "text"] as const)(
+		"final %s replacement invalidates cached feedback before subsequent tool insertion",
+		async (replacement) => {
+			const { mode } = createMode();
+			const editor = new CustomEditor(Reflect.get(mode, "ui") as TUI, getEditorTheme(), new KeybindingsManager());
+			Object.assign(mode, { editor, defaultEditor: editor });
+			mode.setupKeyHandlers();
+			await stream(mode, assistant("old"));
+			await finish(mode, "old");
+			const message = assistant("streamed");
+			await mode.handleEvent({ type: "message_start", message: { ...message, content: [] } });
+			editor.handleInput("\x0f");
+			await mode.handleEvent({
+				type: "message_update",
+				message,
+				assistantMessageEvent: { type: "done", reason: "toolUse", message },
+			});
+			const finalized: AssistantMessage =
+				replacement === "tool"
+					? assistant("replacement", [{ type: "text", text: "final prose" }])
+					: { ...message, content: [{ type: "text", text: "final prose" }], stopReason: "stop" };
+			await mode.handleEvent({ type: "message_end", message: finalized });
+			if (replacement === "text") await stream(mode, assistant("replacement"));
+			await finish(mode, "replacement");
+			expect(groups(mode).map((group) => group.tools.map((tool) => tool.getToolCallId()))).toEqual([
+				["old", "streamed"],
+				["replacement"],
+			]);
+			const output = stripAnsi(mode.chatContainer.render(100).join("\n"));
+			expect(output.indexOf("final prose")).toBeGreaterThan(output.indexOf("2 tools"));
+			expect(output.lastIndexOf("1 tool ·")).toBeGreaterThan(output.indexOf("final prose"));
+		},
+	);
 
 	test.each([false, true])(
 		"reused call IDs cannot relocate completed tools from an earlier turn (compact=%s)",

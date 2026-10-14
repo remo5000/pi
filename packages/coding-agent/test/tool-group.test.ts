@@ -1,7 +1,8 @@
 // INV-1 tool-group.ts: folding hides every child row, including images, without resetting output.
 // INV-2 tool-execution.ts: summary status follows partial/final results, not a second state store.
 // INV-3 tool-group.ts: summaries fit narrow widths and clicks affect only their own group.
-// Revert tool-group.ts -> INV-1/3 fail; revert tool-execution.ts -> INV-2 fails.
+// INV-4 tool-group.ts: the membership index follows indexed insertion, removal, and relocation of original components.
+// Revert tool-group.ts -> INV-1/3/4 fail; revert tool-execution.ts -> INV-2 fails.
 import {
 	resetCapabilitiesCache,
 	setCapabilities,
@@ -56,6 +57,25 @@ function click(y = 1): TuiMouseEvent {
 describe("ToolGroupComponent", () => {
 	beforeEach(() => initTheme("dark"));
 	afterEach(() => resetCapabilitiesCache());
+
+	test("membership follows indexed insertion, removal, and relocation of original components", () => {
+		const first = new ToolGroupComponent();
+		const second = new ToolGroupComponent();
+		const one = tool("read", "one");
+		const two = tool("read", "two");
+		first.addTool(two);
+		first.addTool(one, 0);
+		expect(first.tools).toEqual([one, two]);
+		expect(first.hasTool(one)).toBe(true);
+		expect(first.hasTool(two)).toBe(true);
+		expect(second.hasTool(one)).toBe(false);
+		first.removeTool(one);
+		second.addTool(one);
+		expect(first.tools).toEqual([two]);
+		expect(first.hasTool(one)).toBe(false);
+		expect(second.tools).toEqual([one]);
+		expect(second.hasTool(one)).toBe(true);
+	});
 
 	test("derives counts and running/error status from original children", () => {
 		const group = new ToolGroupComponent();
