@@ -52,6 +52,7 @@ function createTreeUI() {
 		showError: vi.fn(),
 		flushCompactionQueue: vi.fn(async () => {}),
 	};
+	Object.setPrototypeOf(ui, InteractiveMode.prototype);
 	const showTreeSelector = Reflect.get(InteractiveMode.prototype, "showTreeSelector") as (this: typeof ui) => void;
 	showTreeSelector.call(ui);
 
